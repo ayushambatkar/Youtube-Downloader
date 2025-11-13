@@ -89,3 +89,13 @@ if st.button("Download"):
             for ext in ("mp4", "mp3"):
                 if os.path.exists(f"download.{ext}"):
                     os.remove(f"download.{ext}")
+
+st.markdown("---")
+st.markdown(
+    "<p style='text-align: center; color: gray;'>"
+    "Afloatwont "
+    "| " \
+    "2025"
+    "</p>",
+    unsafe_allow_html=True
+)
