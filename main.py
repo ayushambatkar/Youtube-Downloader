@@ -1,5 +1,12 @@
 from typing import List, Dict, Any
 from pathlib import Path
+import os
+import threading
+import http.server
+import socketserver
+from urllib.parse import urlparse
+import secrets
+import time
 import base64
 import streamlit as st
 from yt_dlp_helper import YouTubeDownloader
@@ -21,6 +28,106 @@ if "is_playlist" not in st.session_state:
     st.session_state.is_playlist = False
 if "playlist_summary" not in st.session_state:
     st.session_state.playlist_summary = None
+
+# -------------------------------
+# Lightweight background download server
+# Serves files via HTTP so the browser's download manager handles them.
+# Files are deleted immediately after being served once.
+# -------------------------------
+
+@st.cache_resource(show_spinner=False)
+def _get_download_registry() -> dict:
+    # Persistent across Streamlit reruns for this session
+    return {}
+
+DOWNLOAD_REGISTRY: dict = _get_download_registry()
+
+class _TokenDownloadHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):  # silence server logs in Streamlit
+        return
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if not parsed.path.startswith("/dl/"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        token = parsed.path[len("/dl/"):]
+        entry = DOWNLOAD_REGISTRY.get(token)
+        if not entry:
+            self.send_response(404)
+            self.end_headers()
+            return
+        fpath = Path(entry["path"])  # absolute path
+        mime = entry.get("mime") or "application/octet-stream"
+        fname = entry.get("name") or fpath.name
+        if not fpath.exists():
+            self.send_response(410)  # gone
+            self.end_headers()
+            DOWNLOAD_REGISTRY.pop(token, None)
+            return
+        try:
+            size = fpath.stat().st_size
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f"attachment; filename=\"{fname}\"")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            with open(fpath, "rb") as rf:
+                while True:
+                    chunk = rf.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        finally:
+            # One-shot: remove token and delete file
+            try:
+                DOWNLOAD_REGISTRY.pop(token, None)
+            except Exception:
+                pass
+            try:
+                os.remove(fpath)
+            except Exception:
+                pass
+
+class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+
+@st.cache_resource(show_spinner=False)
+def _start_download_server():
+    server = _ThreadingHTTPServer(("127.0.0.1", 0), _TokenDownloadHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, port
+
+def _register_download_file(path: Path, mime: str) -> str:
+    server, port = _start_download_server()
+    token = secrets.token_urlsafe(16)
+    DOWNLOAD_REGISTRY[token] = {"path": str(path), "mime": mime, "name": path.name, "ts": time.time()}
+    _start_cleanup_background()
+    return f"http://127.0.0.1:{port}/dl/{token}"
+
+@st.cache_resource(show_spinner=False)
+def _start_cleanup_background():
+    def _cleaner():
+        TTL = 2 * 60 * 60  # 2 hours
+        while True:
+            now = time.time()
+            for tok, entry in list(DOWNLOAD_REGISTRY.items()):
+                ts = entry.get("ts") or now
+                if now - ts > TTL:
+                    try:
+                        f = Path(entry.get("path", ""))
+                        if f.exists():
+                            f.unlink()
+                    except Exception:
+                        pass
+                    DOWNLOAD_REGISTRY.pop(tok, None)
+            time.sleep(60)
+    thread = threading.Thread(target=_cleaner, daemon=True)
+    thread.start()
+    return True
 
 def _mime_from_ext(ext: str) -> str:
     ext = (ext or "").lower()
@@ -79,6 +186,8 @@ with st.form("fetch_form"):
             try:
                 # First fetch metadata to detect playlist
                 meta = downloader.get_video_metadata(st.session_state.url.strip())
+                # Expose fetched title (video or playlist) for optional display
+                st.session_state.last_title = meta.get("title") or meta.get("id")
                 st.session_state.is_playlist = bool(meta.get("entries"))
                 if st.session_state.is_playlist:
                     st.info(f"Playlist detected with {len(meta.get('entries', []))} videos. Use 'Analyze Playlist Sizes' below for aggregate size estimates.")
@@ -183,6 +292,9 @@ if st.session_state.playlist_summary:
         for row in summary["details"]:
             st.write(f"{row['url']}: {row['video_formats']} video fmts, {row['audio_formats']} audio fmts")
 
+if "last_title" in st.session_state and st.session_state.last_title:
+    st.markdown(f"### Title: {st.session_state.last_title}")
+
 if formats and not st.session_state.is_playlist:
     classified = classify_formats(formats)
     tabs = st.tabs(["🎵 Audio", "🎥 Video"])
@@ -203,36 +315,20 @@ if formats and not st.session_state.is_playlist:
                     with st.spinner("Downloading audio..."):
                         info = downloader.download_format(st.session_state.url.strip(), fmt_id)
                     file_path = Path(info["filepath"])  # server-side temp output
-                    file_name = file_path.name
-                    # Read into memory so we can delete server copy
-                    try:
-                        with open(file_path, "rb") as f:
-                            file_bytes = f.read()
-                    finally:
-                        try:
-                            file_path.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                    st.success(f"Ready: {info['title']} ({info['ext']})")
+                    st.success(f"Preparing download: {info['title']} ({info['ext']})")
                     mime = _mime_from_ext(info.get("ext"))
-                    # Try to auto-trigger download via data URL as well
-                    b64 = base64.b64encode(file_bytes).decode()
-                    download_id = "audio_auto_dl"
-                    # Escape braces in JS for f-string by doubling them
+                    dl_url = _register_download_file(file_path, mime)
+                    # Auto-trigger browser's native download manager via hidden link to our local server
+                    download_id = "audio_http_dl"
                     st.markdown(
                         (
-                            f'<a id="{download_id}" href="data:{mime};base64,{b64}" download="{file_name}" style="display:none;">download</a>'
-                            f'<script>setTimeout(function(){{document.getElementById("{download_id}")?.click();}}, 50);</script>'
+                            f'<a id="{download_id}" href="{dl_url}" download style="display:none;">download</a>'
+                            f'<script>setTimeout(function(){{document.getElementById("{download_id}")?.click();}}, 100);</script>'
                         ),
                         unsafe_allow_html=True,
                     )
-                    # Fallback clickable button
-                    st.download_button(
-                        label="Download file",
-                        data=file_bytes,
-                        file_name=file_name,
-                        mime=mime
-                    )
+                    st.info("Your download should start automatically. If it doesn't, "+
+                            f"click here: [Direct link]({dl_url})")
                 except Exception as e:
                     st.error(f"Audio download failed: {e}")
         else:
@@ -259,33 +355,19 @@ if formats and not st.session_state.is_playlist:
                             selector = fmt_id
                         info = downloader.download_format(st.session_state.url.strip(), selector)
                     file_path = Path(info["filepath"])  # server-side temp output
-                    file_name = file_path.name
-                    # Read into memory so we can delete server copy
-                    try:
-                        with open(file_path, "rb") as f:
-                            file_bytes = f.read()
-                    finally:
-                        try:
-                            file_path.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                    st.success(f"Ready: {info['title']} ({info['ext']})")
+                    st.success(f"Preparing download: {info['title']} ({info['ext']})")
                     mime = _mime_from_ext(info.get("ext"))
-                    b64 = base64.b64encode(file_bytes).decode()
-                    download_id = "video_auto_dl"
+                    dl_url = _register_download_file(file_path, mime)
+                    download_id = "video_http_dl"
                     st.markdown(
                         (
-                            f'<a id="{download_id}" href="data:{mime};base64,{b64}" download="{file_name}" style="display:none;">download</a>'
-                            f'<script>setTimeout(function(){{document.getElementById("{download_id}")?.click();}}, 50);</script>'
+                            f'<a id="{download_id}" href="{dl_url}" download style="display:none;">download</a>'
+                            f'<script>setTimeout(function(){{document.getElementById("{download_id}")?.click();}}, 100);</script>'
                         ),
                         unsafe_allow_html=True,
                     )
-                    st.download_button(
-                        label="Download file",
-                        data=file_bytes,
-                        file_name=file_name,
-                        mime=mime
-                    )
+                    st.info("Your download should start automatically. If it doesn't, "+
+                            f"click here: [Direct link]({dl_url})")
                 except Exception as e:
                     st.error(f"Video download failed: {e}")
         else:
