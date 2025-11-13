@@ -3,7 +3,7 @@ import yt_dlp
 import os
 import re
 
-st.title("🎬 YouTube Downloader with Progress")
+st.title("🎬 AdFree Youtube Downloader")
 
 url = st.text_input("Enter YouTube video URL")
 
